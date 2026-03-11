@@ -23,6 +23,7 @@ import os
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import mean
 from typing import Optional
 
 import draccus
@@ -34,20 +35,18 @@ from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_t
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
-from transformers import AutoConfig, AutoImageProcessor
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-
-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -106,6 +105,10 @@ class FinetuneConfig:
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
+
+    eval_interval: int = 0                                          # Run evaluation after this many steps (0 means no
+                                                                    #     evaluation at all)
+    eval_shuffle_buffer_size: int = shuffle_buffer_size // 20
 
     # fmt: on
 
@@ -237,6 +240,26 @@ def finetune(cfg: FinetuneConfig) -> None:
         num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
     )
 
+    dataloader_eval: Optional[DataLoader] = None
+
+    if cfg.eval_interval > 0:
+        vla_dataset_eval = RLDSDataset(
+            cfg.data_root_dir,
+            cfg.dataset_name,
+            batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.eval_shuffle_buffer_size,  # see if this gonna implodes
+            image_aug=cfg.image_aug,
+            train=False,
+        )
+        dataloader_eval = DataLoader(
+            vla_dataset_eval,
+            batch_size=cfg.batch_size,
+            sampler=None,
+            collate_fn=collator,
+            num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
+        )
+
     # Initialize Logging =>> W&B
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
@@ -248,9 +271,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Train!
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
-        vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
+            vla.train()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output: CausalLMOutputWithPast = vla(
                     input_ids=batch["input_ids"].to(device_id),
@@ -310,12 +333,78 @@ def finetune(cfg: FinetuneConfig) -> None:
                     },
                     step=gradient_step_idx,
                 )
-
             # Optimizer Step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
                 progress.update()
+
+            if cfg.eval_interval > 0 and gradient_step_idx % cfg.eval_interval == 0:
+                # this stop intellisense from throwing a tantrum
+                assert dataloader_eval is not None
+
+                with torch.no_grad():
+                    vla.eval()
+                    total_loss_eval = []
+                    total_eval_action_accuracy = []
+                    total_eval_action_l1_loss = []
+
+                    for eval_batch in dataloader_eval:
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            eval_output: CausalLMOutputWithPast = vla(
+                                input_ids=eval_batch["input_ids"].to(device_id),
+                                attention_mask=eval_batch["attention_mask"].to(device_id),
+                                pixel_values=eval_batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                                labels=eval_batch["labels"],
+                            )
+                            loss_eval = eval_output.loss
+                        # Compute Accuracy and L1 Loss for Logging
+                        eval_action_logits = eval_output.logits[
+                            :, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1
+                        ]
+                        eval_action_preds = eval_action_logits.argmax(dim=2)
+                        eval_action_gt = eval_batch["labels"][:, 1:].to(eval_action_preds.device)
+                        mask = eval_action_gt > action_tokenizer.action_token_begin_idx
+
+                        # Compute Accuracy
+                        eval_correct_preds = (eval_action_preds == eval_action_gt) & mask
+                        eval_action_accuracy = eval_correct_preds.sum().float() / mask.sum().float()
+
+                        # Compute L1 Loss on Predicted (Continuous) Actions
+                        eval_continuous_actions_pred = torch.tensor(
+                            action_tokenizer.decode_token_ids_to_actions(eval_action_preds[mask].cpu().numpy())
+                        )
+                        eval_continuous_actions_gt = torch.tensor(
+                            action_tokenizer.decode_token_ids_to_actions(eval_action_gt[mask].cpu().numpy())
+                        )
+                        eval_action_l1_loss = torch.nn.functional.l1_loss(
+                            eval_continuous_actions_pred, eval_continuous_actions_gt
+                        )
+
+                        total_loss_eval.append(loss_eval.item())
+                        total_eval_action_accuracy.append(eval_action_accuracy.item())
+                        total_eval_action_l1_loss.append(eval_action_l1_loss.item())
+
+                    if distributed_state.is_main_process:
+                        wandb.log(
+                            {
+                                "eval/loss": mean(total_loss_eval),
+                                "eval/action_accuracy": mean(total_eval_action_accuracy),
+                                "eval/l1_loss": mean(total_eval_action_l1_loss),
+                                # histogram?
+                                "eval/loss_hist": wandb.Histogram(total_loss_eval),
+                                "eval/action_accuracy_hist": wandb.Histogram(total_eval_action_accuracy),
+                                "eval/l1_loss_hist": wandb.Histogram(total_eval_action_l1_loss),
+                            },
+                            step=gradient_step_idx,
+                        )
+                        progress.set_description_str(
+                            f"act_acc: {smoothened_action_accuracy:.3f} "
+                            + f"eva_acc: {mean(total_eval_action_accuracy):.3f}",
+                            refresh=False,
+                        )
+                        # TODO: make this whole part a function & remove the `del`
+                        del total_loss_eval, total_eval_action_accuracy, total_eval_action_l1_loss
 
             # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
             if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
